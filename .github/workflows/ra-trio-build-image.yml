@@ -1,0 +1,100 @@
+# RA-Trio fork addition. Not part of upstream PostHog / posthog-foss.
+#
+# Builds the main PostHog application image (root ./Dockerfile, unmodified from upstream)
+# and pushes it to GHCR under this fork's namespace. This is the first tracked change on
+# the fork (see /FORK.md) and exists so that once a real patch lands, the local stack can
+# switch from upstream's prebuilt image to one built from this repo.
+#
+# Deliberately NOT wired to push on master/main — upstream syncs into this fork's default
+# branch should never trigger a build. Only two triggers:
+#   - workflow_dispatch: manual, on-demand runs
+#   - push of a tag matching `ra-trio-*`: this fork's own release tags
+#
+# Named `ra-trio-build-image.yml` (rather than something generic like `build.yml` or
+# `docker.yml`) so it can never collide with an upstream workflow file name if/when this
+# fork is next synced from posthog-foss.
+name: RA-Trio Build Image
+
+on:
+    workflow_dispatch:
+        inputs:
+            extra_tag:
+                description: 'Optional additional image tag to push alongside the default sha/ref tags (e.g. a manual smoke-test label)'
+                required: false
+                default: ''
+    push:
+        tags:
+            - 'ra-trio-*'
+
+# Least privilege: only what's needed to check out the repo and push to this repo's own
+# GHCR package. No id-token (not using OIDC/Depot), no ECR/DockerHub credentials — this
+# fork does not have upstream's cloud build infrastructure.
+permissions:
+    contents: read
+    packages: write
+
+env:
+    IMAGE_NAME: ghcr.io/ra-trio/posthog
+
+jobs:
+    build-and-push:
+        name: Build & push (buildx, linux/amd64 + linux/arm64)
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+            # Emulation for the arm64 leg of the multi-arch build on the amd64 GitHub-hosted runner.
+            - name: Set up QEMU
+              uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+              with:
+                  platforms: arm64
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+            # Standard GITHUB_TOKEN packages:write auth — no PAT, no org secret.
+            - name: Log in to GHCR
+              uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Docker metadata
+              id: meta
+              uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+              with:
+                  images: ${{ env.IMAGE_NAME }}
+                  tags: |
+                      type=sha,format=long
+                      type=raw,value=${{ github.sha }}
+                      type=ref,event=tag
+                      type=raw,value=${{ github.event.inputs.extra_tag }},enable=${{ github.event.inputs.extra_tag != '' }}
+
+            # Reuses upstream's production Dockerfile as-is (root ./Dockerfile — the same one
+            # posthog/posthog and PostHog Cloud build from). Not modified for this pipeline.
+            #
+            # Build args mirror what upstream's own build-n-cache-image composite action passes
+            # (COMMIT_HASH) plus the GITHUB_* args the Dockerfile's sourcemap-upload stage reads
+            # for release metadata. That stage requires a `posthog_upload_sourcemaps_cli_api_key`
+            # secret this fork does not have; without it, the Dockerfile's own fallback logic skips
+            # the upload and retains sourcemaps in the image rather than failing the build.
+            - name: Build and push
+              uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+              with:
+                  context: .
+                  file: ./Dockerfile
+                  platforms: linux/amd64,linux/arm64
+                  push: true
+                  tags: ${{ steps.meta.outputs.tags }}
+                  labels: ${{ steps.meta.outputs.labels }}
+                  build-args: |
+                      COMMIT_HASH=${{ github.sha }}
+                      GITHUB_ACTIONS=true
+                      GITHUB_SHA=${{ github.sha }}
+                      GITHUB_REF_NAME=${{ github.ref_name }}
+                      GITHUB_REPOSITORY=${{ github.repository }}
+                      GITHUB_SERVER_URL=${{ github.server_url }}
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
